@@ -163,6 +163,25 @@ mcp-remote-go --url=https://mcp.example.com --transport sse-only
 mcp-remote-go --url=https://api.example.com --header "X-API-Key: abc" --debug
 ```
 
+**Binary not found:**
+If `mcp-remote-go` command is not found, use the full path to the binary:
+```bash
+# Find the binary location
+which mcp-remote-go
+# or
+go env GOPATH/bin/mcp-remote-go
+
+# Use full path in Claude Desktop config
+{
+  "mcpServers": {
+    "remote": {
+      "command": "/full/path/to/mcp-remote-go",
+      "args": ["--url=https://mcp.example.com"]
+    }
+  }
+}
+```
+
 ## Security
 🔒 HTTPS enforced (dev: `--allow-http`)  
 🔑 Simple header-based authentication  
