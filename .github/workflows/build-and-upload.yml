@@ -6,32 +6,38 @@ on:
   workflow_dispatch:
 
 env:
-  GO_VERSION: '1.24.0'
+  GO_VERSION: '1.21'
 
 jobs:
   build:
-    name: Build for ${{ matrix.os }}-${{ matrix.arch }}
+    name: Build for ${{ matrix.platform }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
-            arch: amd64
+            goos: linux
+            goarch: amd64
             platform: linux-amd64
           - os: ubuntu-latest
-            arch: arm64
+            goos: linux
+            goarch: arm64
             platform: linux-arm64
           - os: macos-latest
-            arch: amd64
+            goos: darwin
+            goarch: amd64
             platform: darwin-amd64
           - os: macos-latest
-            arch: arm64
+            goos: darwin
+            goarch: arm64
             platform: darwin-arm64
           - os: windows-latest
-            arch: amd64
+            goos: windows
+            goarch: amd64
             platform: windows-amd64
           - os: windows-latest
-            arch: arm64
+            goos: windows
+            goarch: arm64
             platform: windows-arm64
 
     steps:
@@ -60,16 +66,21 @@ jobs:
         run: go test ./...
 
       - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        shell: bash
         run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
+          if [ "${{ matrix.goos }}" = "windows" ]; then
             go build -ldflags="-s -w" -o mcp-remote-go-${{ matrix.platform }}.exe .
           else
             go build -ldflags="-s -w" -o mcp-remote-go-${{ matrix.platform }} .
           fi
 
       - name: Create checksums
+        shell: bash
         run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
+          if [ "${{ matrix.goos }}" = "windows" ]; then
             sha256sum mcp-remote-go-${{ matrix.platform }}.exe > mcp-remote-go-${{ matrix.platform }}.exe.sha256
           else
             sha256sum mcp-remote-go-${{ matrix.platform }} > mcp-remote-go-${{ matrix.platform }}.sha256
@@ -81,13 +92,12 @@ jobs:
           version: latest
 
       - name: Upload to Supabase Storage
+        shell: bash
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
         run: |
-          # Set up Supabase CLI with access token
-          export SUPABASE_ACCESS_TOKEN="${{ secrets.SUPABASE_ACCESS_TOKEN }}"
-          export PROJECT_ID="${{ secrets.SUPABASE_PROJECT_ID }}"
-          
-          # Upload files to Supabase Storage using CLI
-          if [ "${{ runner.os }}" = "Windows" ]; then
+          if [ "${{ matrix.goos }}" = "windows" ]; then
             supabase storage upload releases/${{ github.ref_name }}/mcp-remote-go-${{ matrix.platform }}.exe mcp-remote-go-${{ matrix.platform }}.exe --project-ref $PROJECT_ID
             supabase storage upload releases/${{ github.ref_name }}/mcp-remote-go-${{ matrix.platform }}.exe.sha256 mcp-remote-go-${{ matrix.platform }}.exe.sha256 --project-ref $PROJECT_ID
           else
