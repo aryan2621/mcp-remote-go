@@ -2,9 +2,6 @@ name: Build and Upload to Supabase
 
 on:
   push:
-    branches: [ main, develop ]
-    tags: [ 'v*' ]
-  pull_request:
     branches: [ main ]
   workflow_dispatch:
 
@@ -78,14 +75,25 @@ jobs:
             sha256sum mcp-remote-go-${{ matrix.platform }} > mcp-remote-go-${{ matrix.platform }}.sha256
           fi
 
-      - name: Upload to Supabase Storage
-        uses: supabase/storage-action@v1
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
         with:
-          supabase-url: ${{ secrets.SUPABASE_URL }}
-          supabase-service-role-key: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          bucket-name: releases
-          local-path: mcp-remote-go-${{ matrix.platform }}*
-          remote-path: ${{ github.ref_name }}/mcp-remote-go-${{ matrix.platform }}*
+          version: latest
+
+      - name: Upload to Supabase Storage
+        run: |
+          # Set up Supabase CLI with access token
+          export SUPABASE_ACCESS_TOKEN="${{ secrets.SUPABASE_ACCESS_TOKEN }}"
+          export PROJECT_ID="${{ secrets.SUPABASE_PROJECT_ID }}"
+          
+          # Upload files to Supabase Storage using CLI
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            supabase storage upload releases/${{ github.ref_name }}/mcp-remote-go-${{ matrix.platform }}.exe mcp-remote-go-${{ matrix.platform }}.exe --project-ref $PROJECT_ID
+            supabase storage upload releases/${{ github.ref_name }}/mcp-remote-go-${{ matrix.platform }}.exe.sha256 mcp-remote-go-${{ matrix.platform }}.exe.sha256 --project-ref $PROJECT_ID
+          else
+            supabase storage upload releases/${{ github.ref_name }}/mcp-remote-go-${{ matrix.platform }} mcp-remote-go-${{ matrix.platform }} --project-ref $PROJECT_ID
+            supabase storage upload releases/${{ github.ref_name }}/mcp-remote-go-${{ matrix.platform }}.sha256 mcp-remote-go-${{ matrix.platform }}.sha256 --project-ref $PROJECT_ID
+          fi
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
