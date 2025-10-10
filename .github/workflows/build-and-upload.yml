@@ -89,12 +89,14 @@ jobs:
           curl -X POST \
             "${SUPABASE_URL}/storage/v1/object/releases/${REF_NAME}/${BINARY_FILE}" \
             -H "Authorization: Bearer ${SUPABASE_KEY}" \
+            -H "apikey: ${SUPABASE_KEY}" \
             -H "Content-Type: application/octet-stream" \
             --data-binary @"${BINARY_FILE}"
           
           curl -X POST \
             "${SUPABASE_URL}/storage/v1/object/releases/${REF_NAME}/${CHECKSUM_FILE}" \
             -H "Authorization: Bearer ${SUPABASE_KEY}" \
+            -H "apikey: ${SUPABASE_KEY}" \
             -H "Content-Type: text/plain" \
             --data-binary @"${CHECKSUM_FILE}"
 
