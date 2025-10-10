@@ -86,24 +86,32 @@ jobs:
             sha256sum mcp-remote-go-${{ matrix.platform }} > mcp-remote-go-${{ matrix.platform }}.sha256
           fi
 
-      - name: Setup Supabase CLI
-        uses: supabase/setup-cli@v1
-        with:
-          version: latest
-
       - name: Upload to Supabase Storage
         shell: bash
         env:
-          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-          PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
+          SUPABASE_URL: https://${{ secrets.SUPABASE_PROJECT_ID }}.supabase.co
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
+          REF_NAME="${{ github.ref_name }}"
           if [ "${{ matrix.goos }}" = "windows" ]; then
-            supabase storage upload releases/${{ github.ref_name }}/mcp-remote-go-${{ matrix.platform }}.exe mcp-remote-go-${{ matrix.platform }}.exe --project-ref $PROJECT_ID
-            supabase storage upload releases/${{ github.ref_name }}/mcp-remote-go-${{ matrix.platform }}.exe.sha256 mcp-remote-go-${{ matrix.platform }}.exe.sha256 --project-ref $PROJECT_ID
+            BINARY_FILE="mcp-remote-go-${{ matrix.platform }}.exe"
+            CHECKSUM_FILE="mcp-remote-go-${{ matrix.platform }}.exe.sha256"
           else
-            supabase storage upload releases/${{ github.ref_name }}/mcp-remote-go-${{ matrix.platform }} mcp-remote-go-${{ matrix.platform }} --project-ref $PROJECT_ID
-            supabase storage upload releases/${{ github.ref_name }}/mcp-remote-go-${{ matrix.platform }}.sha256 mcp-remote-go-${{ matrix.platform }}.sha256 --project-ref $PROJECT_ID
+            BINARY_FILE="mcp-remote-go-${{ matrix.platform }}"
+            CHECKSUM_FILE="mcp-remote-go-${{ matrix.platform }}.sha256"
           fi
+          
+          curl -X POST \
+            "${SUPABASE_URL}/storage/v1/object/releases/${REF_NAME}/${BINARY_FILE}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"${BINARY_FILE}"
+          
+          curl -X POST \
+            "${SUPABASE_URL}/storage/v1/object/releases/${REF_NAME}/${CHECKSUM_FILE}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
+            -H "Content-Type: text/plain" \
+            --data-binary @"${CHECKSUM_FILE}"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
