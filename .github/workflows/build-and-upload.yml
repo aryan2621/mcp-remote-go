@@ -48,18 +48,6 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: false
-
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-${{ matrix.goarch }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.goarch }}-go-
-
-      - name: Download dependencies
-        run: go mod download
 
       - name: Build binary
         env:
@@ -83,28 +71,11 @@ jobs:
             sha256sum mcp-remote-go-${{ matrix.platform }} > mcp-remote-go-${{ matrix.platform }}.sha256
           fi
 
-      - name: Ensure Supabase bucket exists
-        if: matrix.os == 'ubuntu-latest' && matrix.goarch == 'amd64'
-        shell: bash
-        env:
-          SUPABASE_URL: https://${{ secrets.SUPABASE_PROJECT_ID }}.supabase.co
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: |
-          curl -X POST \
-            "${SUPABASE_URL}/storage/v1/bucket" \
-            -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "id": "releases",
-              "name": "releases",
-              "public": true
-            }' || echo "Bucket may already exist"
-
       - name: Upload to Supabase Storage
         shell: bash
         env:
-          SUPABASE_URL: https://${{ secrets.SUPABASE_PROJECT_ID }}.supabase.co
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           REF_NAME="${{ github.ref_name }}"
           if [ "${{ matrix.goos }}" = "windows" ]; then
@@ -117,13 +88,13 @@ jobs:
           
           curl -X POST \
             "${SUPABASE_URL}/storage/v1/object/releases/${REF_NAME}/${BINARY_FILE}" \
-            -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_KEY}" \
             -H "Content-Type: application/octet-stream" \
             --data-binary @"${BINARY_FILE}"
           
           curl -X POST \
             "${SUPABASE_URL}/storage/v1/object/releases/${REF_NAME}/${CHECKSUM_FILE}" \
-            -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_KEY}" \
             -H "Content-Type: text/plain" \
             --data-binary @"${CHECKSUM_FILE}"
 
@@ -131,8 +102,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mcp-remote-go-${{ matrix.platform }}
-          path: |
-            mcp-remote-go-${{ matrix.platform }}*
+          path: mcp-remote-go-${{ matrix.platform }}*
           retention-days: 30
 
   create-release:
@@ -142,9 +112,6 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -153,8 +120,7 @@ jobs:
       - name: Create release archive
         run: |
           mkdir -p release
-          find ./artifacts -type f -name "mcp-remote-go-*" -not -name "*.sha256" -exec cp {} ./release/ \;
-          find ./artifacts -type f -name "*.sha256" -exec cp {} ./release/ \;
+          find ./artifacts -type f -name "mcp-remote-go-*" -exec cp {} ./release/ \;
           cd release
           tar -czf ../mcp-remote-go-${{ github.ref_name }}.tar.gz .
           cd ..
@@ -169,25 +135,3 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  notify:
-    name: Notify Build Status
-    runs-on: ubuntu-latest
-    needs: [build, create-release]
-    if: always()
-    
-    steps:
-      - name: Notify Success
-        if: needs.build.result == 'success'
-        run: |
-          echo "✅ Build completed successfully for all platforms"
-          echo "📦 Artifacts uploaded to Supabase Storage"
-          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            echo "🚀 Main branch build completed"
-          fi
-
-      - name: Notify Failure
-        if: needs.build.result == 'failure'
-        run: |
-          echo "❌ Build failed for one or more platforms"
-          exit 1
