@@ -8,7 +8,7 @@ TEST 1: Legacy SSE Transport (HTTP+SSE 2024-11-05)
 ================================================================================
 
 Start bridge:
-go run main.go --url=https://mcp.clappia.com/sse --header "X-Api-Key: clp_sk_1a2b3c4d5e6f7g8h9i0j" --debug
+go run main.go --url=https://mcp.example.com/sse --header "X-Api-Key: clp_sk_1a2b3c4d5e6f7g8h9i0j" --debug
 
 Paste these lines one by one (press ENTER after each):
 
@@ -86,7 +86,7 @@ TEST 5: Force SSE-only Strategy
 ================================================================================
 
 Start bridge:
-go run main.go --url=https://mcp.clappia.com/sse --header "X-Api-Key: clp_sk_1a2b3c4d5e6f7g8h9i0j" --transport sse-only --debug
+go run main.go --url=https://mcp.example.com/sse --header "X-Api-Key: clp_sk_1a2b3c4d5e6f7g8h9i0j" --transport sse-only --debug
 
 Paste these lines:
 
