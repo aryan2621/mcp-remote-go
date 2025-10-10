@@ -1,0 +1,219 @@
+=== MCP Remote Go - Transport Test Suite ===
+
+This file contains test commands for all transport methods.
+Copy and paste the JSON lines (NOT the echo commands) into the running bridge.
+
+================================================================================
+TEST 1: Legacy SSE Transport (HTTP+SSE 2024-11-05)
+================================================================================
+
+Start bridge:
+go run main.go --url=https://mcp.clappia.com/sse --header "X-Api-Key: clp_sk_1a2b3c4d5e6f7g8h9i0j" --debug
+
+Paste these lines one by one (press ENTER after each):
+
+1. Initialize:
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mcp-remote-go","version":"1.0.0"}}}
+
+2. Initialized notification (wait for response from step 1 first):
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+
+3. List tools:
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+
+4. List resources:
+{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}
+
+5. List prompts:
+{"jsonrpc":"2.0","id":4,"method":"prompts/list","params":{}}
+
+================================================================================
+TEST 2: Streamable HTTP Transport (MCP 2025-06-18)
+================================================================================
+
+Start bridge (replace with your streamable HTTP server):
+go run main.go --url=https://example.com/mcp --header "Authorization: Bearer YOUR_TOKEN" --debug
+
+Paste these lines:
+
+1. Initialize:
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"mcp-remote-go","version":"1.0.0"}}}
+
+2. Initialized notification:
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+
+3. List tools:
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+
+================================================================================
+TEST 3: Modern SSE Transport (Same endpoint GET/POST)
+================================================================================
+
+Start bridge (if server supports GET and POST on same endpoint):
+go run main.go --url=https://example.com/sse --header "X-API-Key: YOUR_KEY" --debug
+
+Paste these lines:
+
+1. Initialize:
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"mcp-remote-go","version":"1.0.0"}}}
+
+2. Initialized notification:
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+
+3. List tools:
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+
+================================================================================
+TEST 4: Pure HTTP Transport (No SSE)
+================================================================================
+
+Start bridge with http-only strategy:
+go run main.go --url=https://example.com/api --header "Authorization: Bearer TOKEN" --transport http-only --debug
+
+Paste these lines:
+
+1. Initialize:
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"mcp-remote-go","version":"1.0.0"}}}
+
+2. Initialized notification:
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+
+3. List tools:
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+
+================================================================================
+TEST 5: Force SSE-only Strategy
+================================================================================
+
+Start bridge:
+go run main.go --url=https://mcp.clappia.com/sse --header "X-Api-Key: clp_sk_1a2b3c4d5e6f7g8h9i0j" --transport sse-only --debug
+
+Paste these lines:
+
+1. Initialize:
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mcp-remote-go","version":"1.0.0"}}}
+
+2. Initialized notification:
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+
+3. List tools:
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+
+================================================================================
+AUTOMATED TEST SCRIPTS
+================================================================================
+
+Script 1: Legacy SSE Full Test (test_legacy_sse.sh)
+---------------------------------------------------
+#!/bin/bash
+URL="https://mcp.clappia.com/sse"
+API_KEY="clp_sk_1a2b3c4d5e6f7g8h9i0j"
+
+{
+  sleep 2
+  echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mcp-remote-go","version":"1.0.0"}}}'
+  sleep 3
+  echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+  sleep 2
+  echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+  sleep 2
+  echo '{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}'
+  sleep 2
+  echo '{"jsonrpc":"2.0","id":4,"method":"prompts/list","params":{}}'
+  sleep 5
+} | go run main.go --url="$URL" --header "X-Api-Key: $API_KEY" --debug
+
+
+Script 2: Test All Transports (test_all_transports.sh)
+-------------------------------------------------------
+#!/bin/bash
+URL="https://mcp.clappia.com/sse"
+API_KEY="clp_sk_1a2b3c4d5e6f7g8h9i0j"
+
+echo "=== Testing http-first strategy ==="
+{
+  sleep 2
+  echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mcp-remote-go","version":"1.0.0"}}}'
+  sleep 3
+  echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+  sleep 2
+  echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+  sleep 3
+} | go run main.go --url="$URL" --header "X-Api-Key: $API_KEY" --transport http-first --debug
+
+echo ""
+echo "=== Testing sse-first strategy ==="
+{
+  sleep 2
+  echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mcp-remote-go","version":"1.0.0"}}}'
+  sleep 3
+  echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+  sleep 2
+  echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+  sleep 3
+} | go run main.go --url="$URL" --header "X-Api-Key: $API_KEY" --transport sse-first --debug
+
+echo ""
+echo "=== Testing sse-only strategy ==="
+{
+  sleep 2
+  echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mcp-remote-go","version":"1.0.0"}}}'
+  sleep 3
+  echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+  sleep 2
+  echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+  sleep 3
+} | go run main.go --url="$URL" --header "X-Api-Key: $API_KEY" --transport sse-only --debug
+
+
+Script 3: Quick Ping Test (test_ping.sh)
+-----------------------------------------
+#!/bin/bash
+URL="https://mcp.clappia.com/sse"
+API_KEY="clp_sk_1a2b3c4d5e6f7g8h9i0j"
+
+echo "Quick connectivity test..."
+{
+  sleep 2
+  echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"mcp-remote-go","version":"1.0.0"}}}'
+  sleep 3
+} | go run main.go --url="$URL" --header "X-Api-Key: $API_KEY" --debug
+
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+Issue: "Could not parse message"
+Solution: Make sure you're NOT typing "echo" - just paste the JSON directly
+
+Issue: "Invalid request parameters"
+Solution: Must send "initialize" first before any other requests
+
+Issue: "Authentication required"
+Solution: Check your API key/token in --header flag
+
+Issue: "HTTP 405 Method Not Allowed"
+Solution: Server doesn't support that transport, try different strategy
+
+Issue: Bridge connects but no response
+Solution: Check if you need to send "notifications/initialized" after initialize
+
+================================================================================
+EXPECTED SUCCESSFUL OUTPUT
+================================================================================
+
+For Legacy SSE (Clappia server):
+
+[DEBUG] Legacy SSE transport (2024-11-05) succeeded
+[DEBUG] Connected to remote server
+[DEBUG] Legacy SSE: Extracted POST endpoint: https://mcp.clappia.com/messages/?session_id=XXXXX
+[DEBUG] Legacy SSE: Extracted session ID: XXXXX
+
+After initialize:
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{...},"serverInfo":{...}}}
+
+After tools/list:
+{"jsonrpc":"2.0","id":2,"result":{"tools":[...]}}
+
+================================================================================

@@ -13,39 +13,42 @@ import (
 	"sync"
 )
 
-type SSETransport struct {
+type LegacySSETransport struct {
 	url             string
 	headers         map[string]string
 	client          *http.Client
 	debugLog        *log.Logger
-	reader          *bufio.Reader
-	resp            *http.Response
+	getReader       *bufio.Reader
+	getResp         *http.Response
 	SessionID       string
 	sessionMux      sync.Mutex
-	baseURL         string
 	protocolVersion string
 	lastEventID     string
 	eventIDMux      sync.Mutex
+	getConnected    bool
+	getConnMux      sync.Mutex
+	postEndpoint    string
+	baseURL         string
 }
 
-func NewSSETransport(url string, headers map[string]string, protocolVersion string, debugLog *log.Logger) (*SSETransport, error) {
+func NewLegacySSETransport(url string, headers map[string]string, protocolVersion string, debugLog *log.Logger) (*LegacySSETransport, error) {
 	u, err := neturl.Parse(url)
 	if err != nil {
 		return nil, err
 	}
 	baseURL := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
 
-	return &SSETransport{
+	return &LegacySSETransport{
 		url:             url,
 		headers:         headers,
 		client:          &http.Client{},
 		debugLog:        debugLog,
-		baseURL:         baseURL,
 		protocolVersion: protocolVersion,
+		baseURL:         baseURL,
 	}, nil
 }
 
-func (t *SSETransport) Connect(ctx context.Context) error {
+func (t *LegacySSETransport) Connect(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", t.url, nil)
 	if err != nil {
 		return err
@@ -66,14 +69,7 @@ func (t *SSETransport) Connect(ctx context.Context) error {
 	}
 	t.eventIDMux.Unlock()
 
-	t.sessionMux.Lock()
-	if t.SessionID != "" {
-		req.Header.Set("Mcp-Session-Id", t.SessionID)
-		t.logDebug("Using session ID: %s", t.SessionID)
-	}
-	t.sessionMux.Unlock()
-
-	t.logDebug("Connecting to SSE endpoint: %s", t.url)
+	t.logDebug("Legacy SSE: Connecting to endpoint: %s", t.url)
 	resp, err := t.client.Do(req)
 	if err != nil {
 		return err
@@ -98,13 +94,10 @@ func (t *SSETransport) Connect(ctx context.Context) error {
 		}
 	case http.StatusNotFound:
 		resp.Body.Close()
-		t.sessionMux.Lock()
-		t.SessionID = ""
-		t.sessionMux.Unlock()
 		return &TransportError{
 			StatusCode:  resp.StatusCode,
-			Message:     "session expired, need re-initialization",
-			IsRetryable: true,
+			Message:     "endpoint not found",
+			IsRetryable: false,
 		}
 	case http.StatusMethodNotAllowed:
 		resp.Body.Close()
@@ -123,30 +116,39 @@ func (t *SSETransport) Connect(ctx context.Context) error {
 		}
 	}
 
-	sessionID := resp.Header.Get("Mcp-Session-Id")
-	if sessionID != "" {
-		t.sessionMux.Lock()
-		t.SessionID = sessionID
-		t.sessionMux.Unlock()
-		t.logDebug("Received session ID from header: %s", sessionID)
-	}
-
-	t.resp = resp
-	t.reader = bufio.NewReader(resp.Body)
-	t.logDebug("SSE transport connected to %s", t.url)
+	t.getResp = resp
+	t.getReader = bufio.NewReader(resp.Body)
+	t.getConnMux.Lock()
+	t.getConnected = true
+	t.getConnMux.Unlock()
+	t.logDebug("Legacy SSE: Connected successfully")
 	return nil
 }
 
-func (t *SSETransport) Send(ctx context.Context, data []byte) error {
-	t.sessionMux.Lock()
-	sessionID := t.SessionID
-	t.sessionMux.Unlock()
+func (t *LegacySSETransport) extractPostEndpoint(message string) {
+	if strings.HasPrefix(message, "/messages/?session_id=") || strings.HasPrefix(message, "/messages?session_id=") {
+		parts := strings.SplitN(message, "session_id=", 2)
+		if len(parts) == 2 {
+			sessionID := strings.TrimSpace(parts[1])
+			t.sessionMux.Lock()
+			t.SessionID = sessionID
+			t.sessionMux.Unlock()
 
-	if sessionID == "" {
-		return fmt.Errorf("no session ID available yet, wait for first SSE message")
+			t.postEndpoint = fmt.Sprintf("%s%s", t.baseURL, message)
+			t.logDebug("Legacy SSE: Extracted POST endpoint: %s", t.postEndpoint)
+			t.logDebug("Legacy SSE: Extracted session ID: %s", sessionID)
+		}
+	} else if strings.Contains(message, "endpoint") {
+		t.postEndpoint = fmt.Sprintf("%s%s", t.baseURL, message)
+		t.logDebug("Legacy SSE: Extracted endpoint from event: %s", t.postEndpoint)
 	}
+}
 
-	postURL := fmt.Sprintf("%s/messages/?session_id=%s", t.baseURL, sessionID)
+func (t *LegacySSETransport) Send(ctx context.Context, data []byte) error {
+	postURL := t.postEndpoint
+	if postURL == "" {
+		return fmt.Errorf("no POST endpoint available, waiting for endpoint message from server")
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", postURL, bytes.NewReader(data))
 	if err != nil {
@@ -157,11 +159,10 @@ func (t *SSETransport) Send(ctx context.Context, data []byte) error {
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("MCP-Protocol-Version", t.protocolVersion)
-	req.Header.Set("Mcp-Session-Id", sessionID)
 
-	t.logDebug("Sending to SSE POST endpoint: %s", postURL)
+	t.logDebug("Legacy SSE: Sending POST to: %s", postURL)
 	resp, err := t.client.Do(req)
 	if err != nil {
 		return err
@@ -172,7 +173,7 @@ func (t *SSETransport) Send(ctx context.Context, data []byte) error {
 
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusAccepted, http.StatusNoContent:
-		t.logDebug("Successfully sent message (status %d)", resp.StatusCode)
+		t.logDebug("Legacy SSE: Successfully sent message (status %d)", resp.StatusCode)
 		return nil
 
 	case http.StatusBadRequest:
@@ -200,6 +201,7 @@ func (t *SSETransport) Send(ctx context.Context, data []byte) error {
 		t.sessionMux.Lock()
 		t.SessionID = ""
 		t.sessionMux.Unlock()
+		t.postEndpoint = ""
 		return &TransportError{
 			StatusCode:  resp.StatusCode,
 			Message:     "session expired, need re-initialization",
@@ -215,9 +217,17 @@ func (t *SSETransport) Send(ctx context.Context, data []byte) error {
 	}
 }
 
-func (t *SSETransport) Receive(ctx context.Context) ([]byte, error) {
+func (t *LegacySSETransport) Receive(ctx context.Context) ([]byte, error) {
+	t.getConnMux.Lock()
+	if !t.getConnected {
+		t.getConnMux.Unlock()
+		return nil, fmt.Errorf("SSE connection not established")
+	}
+	t.getConnMux.Unlock()
+
 	var dataLines []string
 	var eventID string
+	var eventType string
 
 	for {
 		select {
@@ -226,7 +236,7 @@ func (t *SSETransport) Receive(ctx context.Context) ([]byte, error) {
 		default:
 		}
 
-		line, err := t.reader.ReadString('\n')
+		line, err := t.getReader.ReadString('\n')
 		if err != nil {
 			return nil, err
 		}
@@ -241,25 +251,31 @@ func (t *SSETransport) Receive(ctx context.Context) ([]byte, error) {
 					t.eventIDMux.Lock()
 					t.lastEventID = eventID
 					t.eventIDMux.Unlock()
-					t.logDebug("Stored event ID: %s", eventID)
+					t.logDebug("Legacy SSE: Stored event ID: %s", eventID)
 				}
 
-				if strings.HasPrefix(result, "/messages/?session_id=") {
-					t.extractSessionID(result)
+				if eventType == "endpoint" || strings.HasPrefix(result, "/messages") {
+					t.extractPostEndpoint(result)
 					dataLines = nil
 					eventID = ""
+					eventType = ""
 					continue
 				}
 
-				t.logDebug("Received SSE event: %s", result)
+				t.logDebug("Legacy SSE: Received event: %s", result)
 				dataLines = nil
 				eventID = ""
+				eventType = ""
 				return []byte(result), nil
 			}
 			continue
 		}
 
-		if strings.HasPrefix(line, "id: ") {
+		if strings.HasPrefix(line, "event: ") {
+			eventType = strings.TrimPrefix(line, "event: ")
+		} else if strings.HasPrefix(line, "event:") {
+			eventType = strings.TrimPrefix(line, "event:")
+		} else if strings.HasPrefix(line, "id: ") {
 			eventID = strings.TrimPrefix(line, "id: ")
 		} else if strings.HasPrefix(line, "id:") {
 			eventID = strings.TrimPrefix(line, "id:")
@@ -271,79 +287,33 @@ func (t *SSETransport) Receive(ctx context.Context) ([]byte, error) {
 			dataLines = append(dataLines, data)
 		} else if strings.HasPrefix(line, ":") {
 			continue
-		} else if strings.HasPrefix(line, "event: ") {
-			continue
 		}
 	}
 }
 
-func (t *SSETransport) extractSessionID(message string) {
-	parts := strings.Split(message, "session_id=")
-	if len(parts) == 2 {
-		sessionID := strings.TrimSpace(parts[1])
-		t.sessionMux.Lock()
-		t.SessionID = sessionID
-		t.sessionMux.Unlock()
-		t.logDebug("Extracted session ID from message: %s", sessionID)
-	}
-}
-
-func (t *SSETransport) GetSessionID() string {
+func (t *LegacySSETransport) GetSessionID() string {
 	t.sessionMux.Lock()
 	defer t.sessionMux.Unlock()
 	return t.SessionID
 }
 
-func (t *SSETransport) TerminateSession(ctx context.Context) error {
-	t.sessionMux.Lock()
-	sessionID := t.SessionID
-	t.sessionMux.Unlock()
-
-	if sessionID == "" {
-		return nil
-	}
-
-	deleteURL := t.url
-	req, err := http.NewRequestWithContext(ctx, "DELETE", deleteURL, nil)
-	if err != nil {
-		return err
-	}
-
-	for k, v := range t.headers {
-		req.Header.Set(k, v)
-	}
-	req.Header.Set("Mcp-Session-Id", sessionID)
-	req.Header.Set("MCP-Protocol-Version", t.protocolVersion)
-
-	t.logDebug("Terminating session: %s", sessionID)
-	resp, err := t.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusMethodNotAllowed {
-		t.logDebug("Server does not support explicit session termination")
-		return nil
-	}
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("session termination failed: HTTP %d: %s", resp.StatusCode, body)
-	}
-
-	t.logDebug("Session terminated successfully")
+func (t *LegacySSETransport) TerminateSession(ctx context.Context) error {
+	t.logDebug("Legacy SSE: Session termination not supported in legacy transport")
 	return nil
 }
 
-func (t *SSETransport) Close() error {
-	if t.resp != nil {
-		return t.resp.Body.Close()
+func (t *LegacySSETransport) Close() error {
+	t.getConnMux.Lock()
+	defer t.getConnMux.Unlock()
+
+	if t.getResp != nil {
+		t.getConnected = false
+		return t.getResp.Body.Close()
 	}
 	return nil
 }
 
-func (t *SSETransport) logDebug(format string, args ...interface{}) {
+func (t *LegacySSETransport) logDebug(format string, args ...interface{}) {
 	if t.debugLog != nil {
 		t.debugLog.Printf(format, args...)
 	}

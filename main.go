@@ -40,13 +40,11 @@ func init() {
 func main() {
 	flag.Parse()
 
-	// Validate required parameters
 	if *serverURL == "" {
 		printHelp()
 		os.Exit(1)
 	}
 
-	// Validate URL format
 	if !strings.HasPrefix(*serverURL, "http://") && !strings.HasPrefix(*serverURL, "https://") {
 		fmt.Fprintf(os.Stderr, "Error: URL must start with http:// or https://\n")
 		fmt.Fprintf(os.Stderr, "Got: %s\n", *serverURL)
@@ -119,7 +117,7 @@ func printHelp() {
 	fmt.Fprintf(os.Stderr, "  # SSE endpoint\n")
 	fmt.Fprintf(os.Stderr, "  mcp-remote-go --url=https://mcp.example.com/sse\n\n")
 
-	fmt.Fprintf(os.Stderr, "⚙️  Options:\n")
+	fmt.Fprintf(os.Stderr, "⚙️ Options:\n")
 	fmt.Fprintf(os.Stderr, "  --url        Remote MCP server URL (required)\n")
 	fmt.Fprintf(os.Stderr, "  --header     Custom headers (repeatable)\n")
 	fmt.Fprintf(os.Stderr, "  --transport  Transport strategy: http-first, sse-first, http-only, sse-only\n")

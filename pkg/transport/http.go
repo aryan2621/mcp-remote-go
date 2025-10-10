@@ -57,7 +57,7 @@ func (t *HTTPTransport) Send(ctx context.Context, data []byte) error {
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("MCP-Protocol-Version", t.protocolVersion)
 
 	t.sessionMux.Lock()
@@ -95,12 +95,8 @@ func (t *HTTPTransport) Send(ctx context.Context, data []byte) error {
 		}
 		return nil
 
-	case http.StatusAccepted:
-		t.logDebug("Server accepted notification/response (202)")
-		return nil
-
-	case http.StatusNoContent:
-		t.logDebug("Server processed request with no content (204)")
+	case http.StatusAccepted, http.StatusNoContent:
+		t.logDebug("Server processed request (status %d)", resp.StatusCode)
 		return nil
 
 	case http.StatusBadRequest:

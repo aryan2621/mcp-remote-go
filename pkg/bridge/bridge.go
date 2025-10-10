@@ -12,16 +12,14 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/rishabh-verma/mcp-remote-go/pkg/auth"
 	"github.com/rishabh-verma/mcp-remote-go/pkg/config"
 	"github.com/rishabh-verma/mcp-remote-go/pkg/transport"
 )
 
 type Bridge struct {
-	Config      *config.Config
-	DebugLog    *log.Logger
-	ServerHash  string
-	authManager *auth.Manager
+	Config     *config.Config
+	DebugLog   *log.Logger
+	ServerHash string
 }
 
 func NewBridge(cfg *config.Config) *Bridge {
@@ -39,20 +37,16 @@ func NewBridge(cfg *config.Config) *Bridge {
 	}
 
 	return &Bridge{
-		Config:      cfg,
-		DebugLog:    debugLog,
-		ServerHash:  hash,
-		authManager: auth.NewManager(cfg, hash, debugLog),
+		Config:     cfg,
+		DebugLog:   debugLog,
+		ServerHash: hash,
 	}
 }
 
-func (b *Bridge) CreateRemoteTransport(token string) (transport.RemoteTransport, error) {
+func (b *Bridge) CreateRemoteTransport() (transport.RemoteTransport, error) {
 	headers := make(map[string]string)
 	for k, v := range b.Config.Headers {
 		headers[k] = v
-	}
-	if token != "" {
-		headers["Authorization"] = "Bearer " + token
 	}
 
 	detector := transport.NewDetector(b.Config.ServerURL, headers, b.DebugLog)
@@ -103,25 +97,13 @@ func (b *Bridge) Run(ctx context.Context) error {
 		return err
 	}
 
-	token, err := b.authManager.GetOrRefreshToken(ctx)
-	if err != nil {
-		return fmt.Errorf("authentication failed: %w", err)
-	}
-
-	remoteTransport, err := b.CreateRemoteTransport(token)
+	remoteTransport, err := b.CreateRemoteTransport()
 	if err != nil {
 		if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "Unauthorized") {
 			b.LogDebug("Received 401 response, authentication required")
-
-			_, authErr := b.authManager.Handle401Response(ctx, "")
-			if authErr != nil {
-				return fmt.Errorf("authentication required: %w", authErr)
-			}
-
 			return fmt.Errorf("authentication required - please provide API key or token via --header")
-		} else {
-			return err
 		}
+		return err
 	}
 
 	proxy := transport.NewProxy(remoteTransport, b.DebugLog)
