@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+const maxStdinMessage = 10 * 1024 * 1024
+
 type Proxy struct {
 	remoteTransport RemoteTransport
 	debugLog        *log.Logger
@@ -41,7 +43,7 @@ func (p *Proxy) Run(ctx context.Context) error {
 
 	go func() {
 		scanner := bufio.NewScanner(os.Stdin)
-		scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+		scanner.Buffer(make([]byte, 64*1024), maxStdinMessage)
 
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -67,25 +69,38 @@ func (p *Proxy) Run(ctx context.Context) error {
 	}()
 
 	go func() {
+		failures := 0
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				data, err := p.remoteTransport.Receive(ctx)
-				if err != nil {
-					if err != io.EOF && ctx.Err() == nil {
-						p.LogDebug("Remote receive error: %v", err)
-					}
-					return
-				}
+			}
 
-				select {
-				case remoteChan <- data:
-					p.LogDebug("Received from remote: %s", string(data))
-				case <-ctx.Done():
+			data, err := p.remoteTransport.Receive(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
 					return
 				}
+				failures++
+				p.LogDebug("Remote receive error (%d): %v", failures, err)
+				if failures > 5 {
+					errChan <- fmt.Errorf("remote receive failed: %w", err)
+					return
+				}
+				if recErr := p.remoteTransport.Connect(ctx); recErr != nil {
+					errChan <- fmt.Errorf("failed to reconnect after receive error: %w", recErr)
+					return
+				}
+				continue
+			}
+			failures = 0
+
+			select {
+			case remoteChan <- data:
+				p.LogDebug("Received from remote: %s", string(data))
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
@@ -129,6 +144,9 @@ func (p *Proxy) SendWithRetry(ctx context.Context, msg []byte) error {
 		}
 
 		if transportErr, ok := err.(*TransportError); ok {
+			if transportErr.StatusCode == 401 {
+				return fmt.Errorf("authentication failed: %w", err)
+			}
 			if !transportErr.IsRetryable {
 				return err
 			}
@@ -139,10 +157,6 @@ func (p *Proxy) SendWithRetry(ctx context.Context, msg []byte) error {
 					return fmt.Errorf("failed to reconnect: %w", reconnectErr)
 				}
 				continue
-			}
-
-			if transportErr.StatusCode == 401 {
-				return fmt.Errorf("authentication failed, please restart: %w", err)
 			}
 		}
 

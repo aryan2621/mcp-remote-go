@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 type StreamableHTTPTransport struct {
@@ -20,80 +21,114 @@ type StreamableHTTPTransport struct {
 	protocolVersion string
 	SessionID       string
 	sessionMux      sync.Mutex
-	sseReader       *bufio.Reader
 	sseResp         *http.Response
 	sseConnected    bool
 	sseConnMux      sync.Mutex
 	lastEventID     string
 	eventIDMux      sync.Mutex
+	incoming        *incomingQueue
+	closed          bool
+	closeMux        sync.Mutex
+	loopGen         uint64
+	ready           bool
 }
 
 func NewStreamableHTTPTransport(url string, headers map[string]string, protocolVersion string, debugLog *log.Logger) (*StreamableHTTPTransport, error) {
 	return &StreamableHTTPTransport{
 		url:             url,
 		headers:         headers,
-		client:          &http.Client{},
+		client:          newMCPHTTPClient(),
 		debugLog:        debugLog,
 		protocolVersion: protocolVersion,
+		incoming:        newIncomingQueue(),
 	}, nil
 }
 
 func (t *StreamableHTTPTransport) Connect(ctx context.Context) error {
-	t.logDebug("Streamable HTTP: Testing endpoint with POST")
-	
-	testReq, err := http.NewRequestWithContext(ctx, "POST", t.url, bytes.NewReader([]byte(`{"jsonrpc":"2.0","method":"ping","id":0}`)))
-	if err != nil {
-		return err
+	t.sseConnMux.Lock()
+	already := t.ready
+	t.sseConnMux.Unlock()
+	if already {
+		return nil
 	}
 
-	for k, v := range t.headers {
-		testReq.Header.Set(k, v)
-	}
-	testReq.Header.Set("Content-Type", "application/json")
-	testReq.Header.Set("Accept", "application/json, text/event-stream")
-	testReq.Header.Set("MCP-Protocol-Version", t.protocolVersion)
+	t.sessionMux.Lock()
+	needsProbe := t.SessionID == ""
+	t.sessionMux.Unlock()
 
-	testResp, err := t.client.Do(testReq)
-	if err != nil {
-		return err
-	}
-	defer testResp.Body.Close()
-
-	if testResp.StatusCode == 405 || testResp.StatusCode == 404 {
-		return &TransportError{
-			StatusCode:  testResp.StatusCode,
-			Message:     "Streamable HTTP not supported",
-			IsRetryable: false,
+	if needsProbe {
+		if err := t.probe(ctx); err != nil {
+			return err
 		}
 	}
 
-	sessionID := testResp.Header.Get("Mcp-Session-Id")
-	if sessionID != "" {
+	if err := t.openSSEConnection(ctx); err != nil {
+		if te, ok := err.(*TransportError); ok && (te.StatusCode == http.StatusMethodNotAllowed || te.StatusCode == http.StatusNotFound) {
+			t.logDebug("GET SSE not offered; using POST responses only")
+			t.markReady()
+			return nil
+		}
+		return err
+	}
+
+	t.startSSELoop()
+	t.markReady()
+	return nil
+}
+
+func (t *StreamableHTTPTransport) probe(ctx context.Context) error {
+	t.logDebug("Streamable HTTP: Probing endpoint with POST")
+
+	reqCtx, cancel := withRequestTimeout(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, t.url, bytes.NewReader([]byte(`{"jsonrpc":"2.0","method":"ping","id":0}`)))
+	if err != nil {
+		return err
+	}
+	t.applyHeaders(req, "application/json", "application/json, text/event-stream")
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if sessionID := captureSessionID(resp); sessionID != "" {
 		t.sessionMux.Lock()
 		t.SessionID = sessionID
 		t.sessionMux.Unlock()
 		t.logDebug("Received session ID: %s", sessionID)
 	}
 
-	io.ReadAll(testResp.Body)
+	if resp.StatusCode == http.StatusUnauthorized {
+		return classifyStatus(resp.StatusCode, string(body))
+	}
+	if resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotFound {
+		return &TransportError{
+			StatusCode:  resp.StatusCode,
+			Message:     "Streamable HTTP not supported",
+			IsRetryable: false,
+		}
+	}
 
-	t.logDebug("Streamable HTTP: Opening GET connection for server messages")
-	return t.openSSEConnection(ctx)
+	// Discard the probe body. Enqueueing it makes Cursor treat the ping
+	// result (often id 0 / empty result) as initialize.
+	t.logDebug("Streamable HTTP: Probe completed (HTTP %d, %d bytes discarded)", resp.StatusCode, len(body))
+	return nil
 }
 
 func (t *StreamableHTTPTransport) openSSEConnection(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", t.url, nil)
+	t.closeSSE()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.url, nil)
 	if err != nil {
 		return err
 	}
-
-	for k, v := range t.headers {
-		req.Header.Set(k, v)
-	}
-	req.Header.Set("Accept", "text/event-stream")
+	t.applyHeaders(req, "", "text/event-stream")
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("MCP-Protocol-Version", t.protocolVersion)
 
 	t.eventIDMux.Lock()
 	if t.lastEventID != "" {
@@ -101,12 +136,6 @@ func (t *StreamableHTTPTransport) openSSEConnection(ctx context.Context) error {
 		t.logDebug("Resuming with Last-Event-ID: %s", t.lastEventID)
 	}
 	t.eventIDMux.Unlock()
-
-	t.sessionMux.Lock()
-	if t.SessionID != "" {
-		req.Header.Set("Mcp-Session-Id", t.SessionID)
-	}
-	t.sessionMux.Unlock()
 
 	resp, err := t.client.Do(req)
 	if err != nil {
@@ -116,41 +145,98 @@ func (t *StreamableHTTPTransport) openSSEConnection(ctx context.Context) error {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return &TransportError{
-			StatusCode:  resp.StatusCode,
-			Message:     string(body),
-			IsRetryable: resp.StatusCode >= 500,
-		}
+		return classifyStatus(resp.StatusCode, string(body))
 	}
 
-	t.sseResp = resp
-	t.sseReader = bufio.NewReader(resp.Body)
 	t.sseConnMux.Lock()
+	t.sseResp = resp
 	t.sseConnected = true
 	t.sseConnMux.Unlock()
-	
+
 	t.logDebug("Streamable HTTP: SSE connection established")
 	return nil
 }
 
+func (t *StreamableHTTPTransport) startSSELoop() {
+	t.sseConnMux.Lock()
+	t.loopGen++
+	gen := t.loopGen
+	t.sseConnMux.Unlock()
+	go t.sseLoop(gen)
+}
+
+func (t *StreamableHTTPTransport) sseLoop(gen uint64) {
+	backoff := time.Second
+	for {
+		if t.isClosed() || t.currentLoopGen() != gen {
+			return
+		}
+
+		t.sseConnMux.Lock()
+		resp := t.sseResp
+		t.sseConnMux.Unlock()
+		if resp == nil {
+			return
+		}
+
+		reader := bufio.NewReader(resp.Body)
+		for {
+			if t.isClosed() || t.currentLoopGen() != gen {
+				return
+			}
+			ev, err := readSSEEvent(reader)
+			if err != nil {
+				t.logDebug("Streamable HTTP: SSE read ended: %v", err)
+				t.closeSSE()
+				break
+			}
+			if ev.id != "" {
+				t.eventIDMux.Lock()
+				t.lastEventID = ev.id
+				t.eventIDMux.Unlock()
+			}
+			if ev.data == "" {
+				continue
+			}
+			t.logDebug("Received SSE event: %s", ev.data)
+			_ = t.incoming.push(context.Background(), []byte(ev.data))
+		}
+
+		if t.isClosed() || t.currentLoopGen() != gen {
+			return
+		}
+
+		t.logDebug("Streamable HTTP: Reconnecting SSE in %s", backoff)
+		time.Sleep(backoff)
+		if t.isClosed() || t.currentLoopGen() != gen {
+			return
+		}
+		if backoff < 16*time.Second {
+			backoff *= 2
+		}
+		if err := t.openSSEConnection(context.Background()); err != nil {
+			t.logDebug("Streamable HTTP: SSE reconnect failed: %v", err)
+			continue
+		}
+		backoff = time.Second
+	}
+}
+
+func (t *StreamableHTTPTransport) currentLoopGen() uint64 {
+	t.sseConnMux.Lock()
+	defer t.sseConnMux.Unlock()
+	return t.loopGen
+}
+
 func (t *StreamableHTTPTransport) Send(ctx context.Context, data []byte) error {
-	req, err := http.NewRequestWithContext(ctx, "POST", t.url, bytes.NewReader(data))
+	reqCtx, cancel := withRequestTimeout(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, t.url, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
-
-	for k, v := range t.headers {
-		req.Header.Set(k, v)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("MCP-Protocol-Version", t.protocolVersion)
-
-	t.sessionMux.Lock()
-	if t.SessionID != "" {
-		req.Header.Set("Mcp-Session-Id", t.SessionID)
-	}
-	t.sessionMux.Unlock()
+	t.applyHeaders(req, "application/json", "application/json, text/event-stream")
 
 	t.logDebug("Streamable HTTP: Sending POST")
 	resp, err := t.client.Do(req)
@@ -159,111 +245,34 @@ func (t *StreamableHTTPTransport) Send(ctx context.Context, data []byte) error {
 	}
 	defer resp.Body.Close()
 
+	if sessionID := captureSessionID(resp); sessionID != "" {
+		t.sessionMux.Lock()
+		t.SessionID = sessionID
+		t.sessionMux.Unlock()
+	}
+
 	body, _ := io.ReadAll(resp.Body)
 
 	switch resp.StatusCode {
-	case http.StatusOK, http.StatusAccepted, http.StatusNoContent:
+	case http.StatusOK:
+		ct := resp.Header.Get("Content-Type")
+		if strings.Contains(ct, "text/event-stream") {
+			return enqueueSSEBytes(ctx, t.incoming, body)
+		}
+		return t.incoming.push(ctx, body)
+	case http.StatusAccepted, http.StatusNoContent:
 		t.logDebug("Successfully sent message (status %d)", resp.StatusCode)
 		return nil
-
-	case http.StatusBadRequest:
-		return &TransportError{
-			StatusCode:  resp.StatusCode,
-			Message:     string(body),
-			IsRetryable: false,
-		}
-
-	case http.StatusUnauthorized:
-		return &TransportError{
-			StatusCode:  resp.StatusCode,
-			Message:     "authentication required or token invalid",
-			IsRetryable: true,
-		}
-
-	case http.StatusForbidden:
-		return &TransportError{
-			StatusCode:  resp.StatusCode,
-			Message:     "insufficient permissions",
-			IsRetryable: false,
-		}
-
 	case http.StatusNotFound:
-		t.sessionMux.Lock()
-		t.SessionID = ""
-		t.sessionMux.Unlock()
-		return &TransportError{
-			StatusCode:  resp.StatusCode,
-			Message:     "session expired, need re-initialization",
-			IsRetryable: true,
-		}
-
+		t.resetSession()
+		return classifyStatus(resp.StatusCode, string(body))
 	default:
-		return &TransportError{
-			StatusCode:  resp.StatusCode,
-			Message:     string(body),
-			IsRetryable: resp.StatusCode >= 500,
-		}
+		return classifyStatus(resp.StatusCode, string(body))
 	}
 }
 
 func (t *StreamableHTTPTransport) Receive(ctx context.Context) ([]byte, error) {
-	t.sseConnMux.Lock()
-	if !t.sseConnected {
-		t.sseConnMux.Unlock()
-		return nil, fmt.Errorf("SSE connection not established")
-	}
-	t.sseConnMux.Unlock()
-
-	var dataLines []string
-	var eventID string
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		line, err := t.sseReader.ReadString('\n')
-		if err != nil {
-			return nil, err
-		}
-
-		line = strings.TrimRight(line, "\r\n")
-
-		if line == "" {
-			if len(dataLines) > 0 {
-				result := strings.Join(dataLines, "\n")
-
-				if eventID != "" {
-					t.eventIDMux.Lock()
-					t.lastEventID = eventID
-					t.eventIDMux.Unlock()
-					t.logDebug("Stored event ID: %s", eventID)
-				}
-
-				t.logDebug("Received SSE event: %s", result)
-				dataLines = nil
-				eventID = ""
-				return []byte(result), nil
-			}
-			continue
-		}
-
-		if strings.HasPrefix(line, "id: ") {
-			eventID = strings.TrimPrefix(line, "id: ")
-		} else if strings.HasPrefix(line, "id:") {
-			eventID = strings.TrimPrefix(line, "id:")
-		} else if strings.HasPrefix(line, "data: ") {
-			data := strings.TrimPrefix(line, "data: ")
-			dataLines = append(dataLines, data)
-		} else if strings.HasPrefix(line, "data:") {
-			data := strings.TrimPrefix(line, "data:")
-			dataLines = append(dataLines, data)
-		} else if strings.HasPrefix(line, ":") {
-			continue
-		}
-	}
+	return t.incoming.recv(ctx)
 }
 
 func (t *StreamableHTTPTransport) GetSessionID() string {
@@ -276,21 +285,19 @@ func (t *StreamableHTTPTransport) TerminateSession(ctx context.Context) error {
 	t.sessionMux.Lock()
 	sessionID := t.SessionID
 	t.sessionMux.Unlock()
-
 	if sessionID == "" {
 		return nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "DELETE", t.url, nil)
+	reqCtx, cancel := withRequestTimeout(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodDelete, t.url, nil)
 	if err != nil {
 		return err
 	}
-
-	for k, v := range t.headers {
-		req.Header.Set(k, v)
-	}
+	t.applyHeaders(req, "", "")
 	req.Header.Set("Mcp-Session-Id", sessionID)
-	req.Header.Set("MCP-Protocol-Version", t.protocolVersion)
 
 	t.logDebug("Terminating session: %s", sessionID)
 	resp, err := t.client.Do(req)
@@ -303,25 +310,72 @@ func (t *StreamableHTTPTransport) TerminateSession(ctx context.Context) error {
 		t.logDebug("Server does not support explicit session termination")
 		return nil
 	}
-
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("session termination failed: HTTP %d: %s", resp.StatusCode, body)
 	}
-
 	t.logDebug("Session terminated successfully")
 	return nil
 }
 
 func (t *StreamableHTTPTransport) Close() error {
+	t.closeMux.Lock()
+	t.closed = true
+	t.closeMux.Unlock()
+	t.closeSSE()
+	t.incoming.close()
+	return nil
+}
+
+func (t *StreamableHTTPTransport) applyHeaders(req *http.Request, contentType, accept string) {
+	for k, v := range t.headers {
+		req.Header.Set(k, v)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
+	req.Header.Set("MCP-Protocol-Version", t.protocolVersion)
+	t.sessionMux.Lock()
+	if t.SessionID != "" {
+		req.Header.Set("Mcp-Session-Id", t.SessionID)
+	}
+	t.sessionMux.Unlock()
+}
+
+func (t *StreamableHTTPTransport) markReady() {
+	t.sseConnMux.Lock()
+	t.ready = true
+	t.sseConnMux.Unlock()
+}
+
+func (t *StreamableHTTPTransport) resetSession() {
+	t.sessionMux.Lock()
+	t.SessionID = ""
+	t.sessionMux.Unlock()
+	t.sseConnMux.Lock()
+	t.loopGen++
+	t.ready = false
+	t.sseConnMux.Unlock()
+	t.closeSSE()
+}
+
+func (t *StreamableHTTPTransport) closeSSE() {
 	t.sseConnMux.Lock()
 	defer t.sseConnMux.Unlock()
-	
+	t.sseConnected = false
 	if t.sseResp != nil {
-		t.sseConnected = false
-		return t.sseResp.Body.Close()
+		_ = t.sseResp.Body.Close()
+		t.sseResp = nil
 	}
-	return nil
+}
+
+func (t *StreamableHTTPTransport) isClosed() bool {
+	t.closeMux.Lock()
+	defer t.closeMux.Unlock()
+	return t.closed
 }
 
 func (t *StreamableHTTPTransport) logDebug(format string, args ...interface{}) {

@@ -12,8 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/rishabh-verma/mcp-remote-go/pkg/config"
-	"github.com/rishabh-verma/mcp-remote-go/pkg/transport"
+	"github.com/aryan2621/mcp-remote-go/pkg/config"
+	"github.com/aryan2621/mcp-remote-go/pkg/oauth"
+	"github.com/aryan2621/mcp-remote-go/pkg/transport"
 )
 
 type Bridge struct {
@@ -76,6 +77,15 @@ func (b *Bridge) LogDebug(format string, args ...interface{}) {
 	}
 }
 
+func authorizationHeader(headers map[string]string) (string, bool) {
+	for k, v := range headers {
+		if strings.EqualFold(k, "Authorization") && strings.TrimSpace(v) != "" {
+			return v, true
+		}
+	}
+	return "", false
+}
+
 func HashURL(serverURL string) string {
 	normalizedURL := serverURL
 	if len(normalizedURL) > 0 && normalizedURL[len(normalizedURL)-1] == '/' {
@@ -91,17 +101,28 @@ func (b *Bridge) Run(ctx context.Context) error {
 	b.LogDebug("Server URL: %s", b.Config.ServerURL)
 	b.LogDebug("Transport strategy: %s", b.Config.Transport)
 	b.LogDebug("Protocol version: %s", b.Config.ProtocolVersion)
-	b.LogDebug("Headers: %+v", b.Config.Headers)
+	b.LogDebug("Headers: %+v", transport.RedactHeaders(b.Config.Headers))
 
 	if err := b.ValidateURL(); err != nil {
 		return err
 	}
 
+	if b.Config.OAuth {
+		_, hasAuth := authorizationHeader(b.Config.Headers)
+		mgr, err := oauth.NewManager(b.Config.ServerURL, b.Config.ConfigDir, b.Config.ClientID, b.Config.ClientSecret, hasAuth, b.DebugLog)
+		if err != nil {
+			return err
+		}
+		transport.WrapHTTP(mgr.Wrap)
+		b.LogDebug("OAuth enabled (tokens in OS keychain; file fallback in %s)", b.Config.ConfigDir)
+	} else {
+		transport.WrapHTTP(nil)
+	}
+
 	remoteTransport, err := b.CreateRemoteTransport()
 	if err != nil {
-		if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "Unauthorized") {
-			b.LogDebug("Received 401 response, authentication required")
-			return fmt.Errorf("authentication required - please provide API key or token via --header")
+		if strings.Contains(err.Error(), "401") || strings.Contains(strings.ToLower(err.Error()), "unauthorized") || strings.Contains(strings.ToLower(err.Error()), "authentication required") {
+			return fmt.Errorf("authentication failed: %w", err)
 		}
 		return err
 	}

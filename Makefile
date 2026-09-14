@@ -37,7 +37,6 @@ install:
 # Clean build artifacts
 clean:
 	rm -rf bin/
-	rm -rf ~/.mcp-auth/
 
 # Run tests
 test:

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 type ModernSSETransport struct {
@@ -17,7 +18,6 @@ type ModernSSETransport struct {
 	headers         map[string]string
 	client          *http.Client
 	debugLog        *log.Logger
-	getReader       *bufio.Reader
 	getResp         *http.Response
 	SessionID       string
 	sessionMux      sync.Mutex
@@ -26,24 +26,45 @@ type ModernSSETransport struct {
 	eventIDMux      sync.Mutex
 	getConnected    bool
 	getConnMux      sync.Mutex
+	incoming        *incomingQueue
+	closed          bool
+	closeMux        sync.Mutex
+	loopGen         uint64
 }
 
 func NewModernSSETransport(url string, headers map[string]string, protocolVersion string, debugLog *log.Logger) (*ModernSSETransport, error) {
 	return &ModernSSETransport{
 		url:             url,
 		headers:         headers,
-		client:          &http.Client{},
+		client:          newMCPHTTPClient(),
 		debugLog:        debugLog,
 		protocolVersion: protocolVersion,
+		incoming:        newIncomingQueue(),
 	}, nil
 }
 
 func (t *ModernSSETransport) Connect(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", t.url, nil)
+	t.getConnMux.Lock()
+	already := t.getConnected
+	t.getConnMux.Unlock()
+	if already {
+		return nil
+	}
+
+	if err := t.openSSEConnection(ctx); err != nil {
+		return err
+	}
+	t.startSSELoop()
+	return nil
+}
+
+func (t *ModernSSETransport) openSSEConnection(ctx context.Context) error {
+	t.closeSSE()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.url, nil)
 	if err != nil {
 		return err
 	}
-
 	for k, v := range t.headers {
 		req.Header.Set(k, v)
 	}
@@ -62,7 +83,6 @@ func (t *ModernSSETransport) Connect(ctx context.Context) error {
 	t.sessionMux.Lock()
 	if t.SessionID != "" {
 		req.Header.Set("Mcp-Session-Id", t.SessionID)
-		t.logDebug("Using session ID: %s", t.SessionID)
 	}
 	t.sessionMux.Unlock()
 
@@ -71,74 +91,103 @@ func (t *ModernSSETransport) Connect(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
-	switch resp.StatusCode {
-	case http.StatusOK:
-		break
-	case http.StatusUnauthorized:
-		resp.Body.Close()
-		return &TransportError{
-			StatusCode:  resp.StatusCode,
-			Message:     "authentication required or token invalid",
-			IsRetryable: true,
-		}
-	case http.StatusForbidden:
-		resp.Body.Close()
-		return &TransportError{
-			StatusCode:  resp.StatusCode,
-			Message:     "insufficient permissions",
-			IsRetryable: false,
-		}
-	case http.StatusNotFound:
-		resp.Body.Close()
-		t.sessionMux.Lock()
-		t.SessionID = ""
-		t.sessionMux.Unlock()
-		return &TransportError{
-			StatusCode:  resp.StatusCode,
-			Message:     "session expired, need re-initialization",
-			IsRetryable: true,
-		}
-	case http.StatusMethodNotAllowed:
-		resp.Body.Close()
-		return &TransportError{
-			StatusCode:  resp.StatusCode,
-			Message:     "SSE not supported at this endpoint",
-			IsRetryable: false,
-		}
-	default:
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return &TransportError{
-			StatusCode:  resp.StatusCode,
-			Message:     string(body),
-			IsRetryable: resp.StatusCode >= 500,
+		if resp.StatusCode == http.StatusNotFound {
+			t.sessionMux.Lock()
+			t.SessionID = ""
+			t.sessionMux.Unlock()
 		}
+		return classifyStatus(resp.StatusCode, string(body))
 	}
 
-	sessionID := resp.Header.Get("Mcp-Session-Id")
-	if sessionID != "" {
+	if sessionID := captureSessionID(resp); sessionID != "" {
 		t.sessionMux.Lock()
 		t.SessionID = sessionID
 		t.sessionMux.Unlock()
 		t.logDebug("Received session ID from header: %s", sessionID)
 	}
 
-	t.getResp = resp
-	t.getReader = bufio.NewReader(resp.Body)
 	t.getConnMux.Lock()
+	t.getResp = resp
 	t.getConnected = true
 	t.getConnMux.Unlock()
 	t.logDebug("Modern SSE: Connected successfully")
 	return nil
 }
 
+func (t *ModernSSETransport) startSSELoop() {
+	t.getConnMux.Lock()
+	t.loopGen++
+	gen := t.loopGen
+	t.getConnMux.Unlock()
+	go t.sseLoop(gen)
+}
+
+func (t *ModernSSETransport) sseLoop(gen uint64) {
+	backoff := time.Second
+	for {
+		if t.isClosed() || t.currentLoopGen() != gen {
+			return
+		}
+		t.getConnMux.Lock()
+		resp := t.getResp
+		t.getConnMux.Unlock()
+		if resp == nil {
+			return
+		}
+
+		reader := bufio.NewReader(resp.Body)
+		for {
+			if t.isClosed() || t.currentLoopGen() != gen {
+				return
+			}
+			ev, err := readSSEEvent(reader)
+			if err != nil {
+				t.logDebug("Modern SSE: SSE read ended: %v", err)
+				t.closeSSE()
+				break
+			}
+			if ev.id != "" {
+				t.eventIDMux.Lock()
+				t.lastEventID = ev.id
+				t.eventIDMux.Unlock()
+			}
+			if ev.data == "" {
+				continue
+			}
+			t.logDebug("Modern SSE: Received event: %s", ev.data)
+			_ = t.incoming.push(context.Background(), []byte(ev.data))
+		}
+
+		if t.isClosed() || t.currentLoopGen() != gen {
+			return
+		}
+		t.logDebug("Modern SSE: Reconnecting in %s", backoff)
+		time.Sleep(backoff)
+		if t.isClosed() || t.currentLoopGen() != gen {
+			return
+		}
+		if backoff < 16*time.Second {
+			backoff *= 2
+		}
+		if err := t.openSSEConnection(context.Background()); err != nil {
+			t.logDebug("Modern SSE: reconnect failed: %v", err)
+			continue
+		}
+		backoff = time.Second
+	}
+}
+
 func (t *ModernSSETransport) Send(ctx context.Context, data []byte) error {
-	req, err := http.NewRequestWithContext(ctx, "POST", t.url, bytes.NewReader(data))
+	reqCtx, cancel := withRequestTimeout(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, t.url, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
-
 	for k, v := range t.headers {
 		req.Header.Set(k, v)
 	}
@@ -160,8 +209,7 @@ func (t *ModernSSETransport) Send(ctx context.Context, data []byte) error {
 	}
 	defer resp.Body.Close()
 
-	newSessionID := resp.Header.Get("Mcp-Session-Id")
-	if newSessionID != "" && newSessionID != sessionID {
+	if newSessionID := captureSessionID(resp); newSessionID != "" && newSessionID != sessionID {
 		t.sessionMux.Lock()
 		t.SessionID = newSessionID
 		t.sessionMux.Unlock()
@@ -169,110 +217,32 @@ func (t *ModernSSETransport) Send(ctx context.Context, data []byte) error {
 	}
 
 	body, _ := io.ReadAll(resp.Body)
-
 	switch resp.StatusCode {
-	case http.StatusOK, http.StatusAccepted, http.StatusNoContent:
+	case http.StatusOK:
+		ct := resp.Header.Get("Content-Type")
+		if strings.Contains(ct, "text/event-stream") {
+			return enqueueSSEBytes(ctx, t.incoming, body)
+		}
+		return t.incoming.push(ctx, body)
+	case http.StatusAccepted, http.StatusNoContent:
 		t.logDebug("Modern SSE: Successfully sent message (status %d)", resp.StatusCode)
 		return nil
-
-	case http.StatusBadRequest:
-		return &TransportError{
-			StatusCode:  resp.StatusCode,
-			Message:     string(body),
-			IsRetryable: false,
-		}
-
-	case http.StatusUnauthorized:
-		return &TransportError{
-			StatusCode:  resp.StatusCode,
-			Message:     "authentication required or token invalid",
-			IsRetryable: true,
-		}
-
-	case http.StatusForbidden:
-		return &TransportError{
-			StatusCode:  resp.StatusCode,
-			Message:     "insufficient permissions",
-			IsRetryable: false,
-		}
-
 	case http.StatusNotFound:
 		t.sessionMux.Lock()
 		t.SessionID = ""
 		t.sessionMux.Unlock()
-		return &TransportError{
-			StatusCode:  resp.StatusCode,
-			Message:     "session expired, need re-initialization",
-			IsRetryable: true,
-		}
-
+		t.getConnMux.Lock()
+		t.loopGen++
+		t.getConnMux.Unlock()
+		t.closeSSE()
+		return classifyStatus(resp.StatusCode, string(body))
 	default:
-		return &TransportError{
-			StatusCode:  resp.StatusCode,
-			Message:     string(body),
-			IsRetryable: resp.StatusCode >= 500,
-		}
+		return classifyStatus(resp.StatusCode, string(body))
 	}
 }
 
 func (t *ModernSSETransport) Receive(ctx context.Context) ([]byte, error) {
-	t.getConnMux.Lock()
-	if !t.getConnected {
-		t.getConnMux.Unlock()
-		return nil, fmt.Errorf("SSE connection not established")
-	}
-	t.getConnMux.Unlock()
-
-	var dataLines []string
-	var eventID string
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		line, err := t.getReader.ReadString('\n')
-		if err != nil {
-			return nil, err
-		}
-
-		line = strings.TrimRight(line, "\r\n")
-
-		if line == "" {
-			if len(dataLines) > 0 {
-				result := strings.Join(dataLines, "\n")
-
-				if eventID != "" {
-					t.eventIDMux.Lock()
-					t.lastEventID = eventID
-					t.eventIDMux.Unlock()
-					t.logDebug("Stored event ID: %s", eventID)
-				}
-
-				t.logDebug("Modern SSE: Received event: %s", result)
-				dataLines = nil
-				eventID = ""
-				return []byte(result), nil
-			}
-			continue
-		}
-
-		if strings.HasPrefix(line, "id: ") {
-			eventID = strings.TrimPrefix(line, "id: ")
-		} else if strings.HasPrefix(line, "id:") {
-			eventID = strings.TrimPrefix(line, "id:")
-		} else if strings.HasPrefix(line, "data: ") {
-			data := strings.TrimPrefix(line, "data: ")
-			dataLines = append(dataLines, data)
-		} else if strings.HasPrefix(line, "data:") {
-			data := strings.TrimPrefix(line, "data:")
-			dataLines = append(dataLines, data)
-		} else if strings.HasPrefix(line, ":") {
-			continue
-		}
-	}
+	return t.incoming.recv(ctx)
 }
 
 func (t *ModernSSETransport) GetSessionID() string {
@@ -285,16 +255,17 @@ func (t *ModernSSETransport) TerminateSession(ctx context.Context) error {
 	t.sessionMux.Lock()
 	sessionID := t.SessionID
 	t.sessionMux.Unlock()
-
 	if sessionID == "" {
 		return nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "DELETE", t.url, nil)
+	reqCtx, cancel := withRequestTimeout(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodDelete, t.url, nil)
 	if err != nil {
 		return err
 	}
-
 	for k, v := range t.headers {
 		req.Header.Set(k, v)
 	}
@@ -312,25 +283,46 @@ func (t *ModernSSETransport) TerminateSession(ctx context.Context) error {
 		t.logDebug("Server does not support explicit session termination")
 		return nil
 	}
-
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("session termination failed: HTTP %d: %s", resp.StatusCode, body)
 	}
-
 	t.logDebug("Session terminated successfully")
 	return nil
 }
 
 func (t *ModernSSETransport) Close() error {
+	t.closeMux.Lock()
+	t.closed = true
+	t.closeMux.Unlock()
+	t.getConnMux.Lock()
+	t.loopGen++
+	t.getConnMux.Unlock()
+	t.closeSSE()
+	t.incoming.close()
+	return nil
+}
+
+func (t *ModernSSETransport) closeSSE() {
 	t.getConnMux.Lock()
 	defer t.getConnMux.Unlock()
-
+	t.getConnected = false
 	if t.getResp != nil {
-		t.getConnected = false
-		return t.getResp.Body.Close()
+		_ = t.getResp.Body.Close()
+		t.getResp = nil
 	}
-	return nil
+}
+
+func (t *ModernSSETransport) currentLoopGen() uint64 {
+	t.getConnMux.Lock()
+	defer t.getConnMux.Unlock()
+	return t.loopGen
+}
+
+func (t *ModernSSETransport) isClosed() bool {
+	t.closeMux.Lock()
+	defer t.closeMux.Unlock()
+	return t.closed
 }
 
 func (t *ModernSSETransport) logDebug(format string, args ...interface{}) {

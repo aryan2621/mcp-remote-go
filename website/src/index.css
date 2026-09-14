@@ -1,0 +1,89 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: 40 12% 96%;
+  --foreground: 210 24% 10%;
+  --card: 40 20% 99%;
+  --card-foreground: 210 24% 10%;
+  --muted: 40 10% 91%;
+  --muted-foreground: 210 8% 38%;
+  --accent: 173 58% 32%;
+  --accent-foreground: 160 40% 98%;
+  --border: 40 10% 84%;
+  --ring: 173 58% 32%;
+}
+
+.dark {
+  --background: 210 20% 6%;
+  --foreground: 150 12% 92%;
+  --card: 210 16% 9%;
+  --card-foreground: 150 12% 92%;
+  --muted: 210 12% 14%;
+  --muted-foreground: 160 8% 62%;
+  --accent: 168 70% 42%;
+  --accent-foreground: 168 40% 8%;
+  --border: 210 12% 18%;
+  --ring: 168 70% 42%;
+}
+
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-border: hsl(var(--border));
+  --color-ring: hsl(var(--ring));
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-background font-sans text-foreground antialiased;
+  }
+
+  code,
+  pre {
+    @apply font-mono;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex h-9 items-center justify-center rounded-sm px-3.5 text-sm font-medium transition-colors;
+  }
+
+  .btn-primary {
+    @apply bg-accent text-accent-foreground hover:bg-accent/90;
+  }
+
+  .btn-outline {
+    @apply border border-border hover:bg-muted;
+  }
+
+  .btn-ghost {
+    @apply px-2.5 text-muted-foreground hover:bg-muted hover:text-foreground;
+  }
+
+  .tab {
+    @apply border-b-2 border-transparent px-3 py-2 text-sm font-medium text-muted-foreground hover:text-foreground;
+  }
+
+  .tab-active {
+    @apply border-accent text-foreground;
+  }
+}

@@ -1,1 +1,4 @@
 bin/
+website/node_modules/
+website/dist/
+website/node_modules/.tmp/
